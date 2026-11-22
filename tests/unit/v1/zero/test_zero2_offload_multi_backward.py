@@ -410,3 +410,418 @@ class TestZero2OffloadOverflowRecovery(DistributedTest):
                     assert not torch.equal(before[name], after[name]), f"finite step did not update {name}"
         finally:
             engine.destroy()
+
+
+class SplitProjectionModel(torch.nn.Module):
+    """Two bias-free projections whose flat ZeRO group is padded and split across two ranks.
+
+    The group holds 3 + 6 = 9 gradient elements, which ZeRO pads to 12 so each of two ranks
+    owns 6. Rank 0 owns ``first.weight`` whole plus the first half of ``second.weight``.
+    Rank 1 owns the second half of ``second.weight`` at a non-zero source offset, followed
+    by three padding elements, and owns no fragment of ``first.weight`` at all.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.first = torch.nn.Linear(3, 1, bias=False)
+        self.second = torch.nn.Linear(3, 2, bias=False)
+
+    def forward(self, inputs, projections=("first", "second"), scale=1.0):
+        loss = inputs.new_zeros(())
+        for name in projections:
+            projection = getattr(self, name)
+            loss = loss + projection(inputs).sum()
+        return loss * scale
+
+
+# Eighths keep every per-backward gradient and every running sum exact in bf16: the values are
+# k/8 with k < 256, which fits the 8 significand bits bf16 has.
+_SPLIT_INPUT_PATTERN = torch.tensor([[0., 1., 2.], [1., 2., 0.], [2., 0., 1.], [0., 2., 1.]])
+
+
+def _split_inputs(step, call_index, rank):
+    # The two ranks differ by an even amount so their average stays on the same eighths grid.
+    return (_SPLIT_INPUT_PATTERN + 2 * rank + call_index + step) / 8
+
+
+def _expected_linear_gradient(shape, inputs_per_rank):
+    """Independent reference: a bias-free linear layer under a sum loss.
+
+    d(sum(x @ W.T))/dW[o, i] is the column sum of x, the same for every output row o.
+    DeepSpeed averages gradients over the data-parallel ranks, so the reference averages
+    the ranks' inputs before summing the columns.
+    """
+    averaged_inputs = sum(inputs_per_rank) / len(inputs_per_rank)
+    column_sums = averaged_inputs.sum(dim=0)
+    return column_sums.expand(shape).clone()
+
+
+def _split_partition_config(zero_stage,
+                            cpu_offload,
+                            accumulation_dtype,
+                            gradient_clipping=0,
+                            managed=True,
+                            overlap_comm=False):
+    config = {
+        "train_micro_batch_size_per_gpu": 4,
+        "gradient_accumulation_steps": 1,
+        "gradient_clipping": gradient_clipping,
+        "managed_gradient_accumulation": managed,
+        "bf16": {
+            "enabled": True,
+            "bf16_master_weights_and_grads": False,
+            "bf16_optimizer_states": False,
+        },
+        "data_types": {
+            "grad_accum_dtype": accumulation_dtype
+        },
+        "zero_allow_untested_optimizer": True,
+        "zero_force_ds_cpu_optimizer": False,
+        "zero_optimization": {
+            "stage": zero_stage,
+            "reduce_bucket_size": 8,
+            "overlap_comm": overlap_comm
+        },
+    }
+    if cpu_offload:
+        config["zero_optimization"]["offload_optimizer"] = {"device": "cpu", "pin_memory": False}
+    return config
+
+
+def _join_two_rank_group(rank, rendezvous):
+    os.environ["LOCAL_RANK"] = str(rank)
+    accelerator = get_accelerator()
+    accelerator.set_device(rank)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(__compatible_ops__, "deepspeed_shm_comm", False)
+        dist.init_distributed(accelerator.communication_backend_name(),
+                              auto_mpi_discovery=False,
+                              init_method=rendezvous,
+                              rank=rank,
+                              world_size=2,
+                              timeout=timedelta(seconds=60))
+    return accelerator
+
+
+def _spawn_two_ranks(target, tmp_path, *args):
+    # DistributedTest needs one accelerator device per rank, which a CPU-only host cannot report,
+    # so the two-rank cases here launch their own ranks the way the matrix above does.
+    torch.multiprocessing.start_processes(target,
+                                          args=(f"file://{tmp_path / 'rendezvous'}", ) + args,
+                                          nprocs=2,
+                                          join=True,
+                                          start_method="forkserver")
+
+
+def _build_split_engine(accelerator, config, learning_rate):
+    model = SplitProjectionModel().to(device=accelerator.device_name(), dtype=torch.bfloat16)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(0.5)
+    references = {
+        name: torch.nn.Parameter(param.detach().float().cpu().clone())
+        for name, param in model.named_parameters()
+    }
+    reference_optimizer = torch.optim.SGD(references.values(), lr=learning_rate)
+    engine, _, _, _ = deepspeed.initialize(model=model,
+                                           optimizer=torch.optim.SGD(model.parameters(), lr=learning_rate),
+                                           config=config,
+                                           dist_init_required=False)
+    return model, engine, references, reference_optimizer
+
+
+def _assert_gradients(model, expected, label):
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(safe_get_full_grad(param).float().cpu(),
+                                   expected[name],
+                                   rtol=0,
+                                   atol=0,
+                                   msg=f"accumulated gradient for {name} at {label}")
+
+
+def _assert_reference_update(model, engine, references, reference_optimizer, expected, label):
+    for name in expected:
+        references[name].grad = expected[name]
+    reference_optimizer.step()
+    engine.step()
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param.detach().cpu(),
+                                   references[name].detach().to(torch.bfloat16),
+                                   rtol=0,
+                                   atol=0,
+                                   msg=f"parameter update for {name} at {label}")
+
+
+# Each window is the list of (projections, ends_request) backward calls made before one step().
+# Every window gives at least one projection a first use that is not the window's first backward.
+_LATE_FIRST_USE_WINDOWS = [
+    [(("first", ), False), (("first", "second"), True)],
+    [(("first", ), True), (("second", ), True)],
+    [(("second", ), False), (("first", ), True), (("first", "second"), True)],
+    [(("first", ), True), (("second", ), False), (("second", ), True), (("first", "second"), True)],
+]
+
+
+def _run_split_partition_requests(rank, rendezvous, zero_stage, cpu_offload, accumulation_dtype, overlap_comm):
+    accelerator = _join_two_rank_group(rank, rendezvous)
+    engine = None
+    try:
+        config = _split_partition_config(zero_stage, cpu_offload, accumulation_dtype, overlap_comm=overlap_comm)
+        model, engine, references, reference_optimizer = _build_split_engine(accelerator, config, 1 / 64)
+        for step, window in enumerate(_LATE_FIRST_USE_WINDOWS):
+            expected = {name: torch.zeros_like(reference) for name, reference in references.items()}
+            for call_index, (projections, ends_request) in enumerate(window):
+                inputs_per_rank = [_split_inputs(step, call_index, r) for r in range(2)]
+                engine.set_gradient_accumulation_boundary(ends_request)
+                device_inputs = inputs_per_rank[rank].to(device=engine.device, dtype=torch.bfloat16)
+                engine.backward(engine(device_inputs, projections))
+                for name in projections:
+                    weight = f"{name}.weight"
+                    expected[weight] += _expected_linear_gradient(expected[weight].shape, inputs_per_rank)
+            label = f"step={step}, window={window}"
+            _assert_gradients(model, expected, label)
+            _assert_reference_update(model, engine, references, reference_optimizer, expected, label)
+    finally:
+        if engine is not None:
+            engine.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(get_accelerator().device_name() not in ("cpu", "cuda")
+                    or (get_accelerator().device_name() == "cuda" and get_accelerator().device_count() < 2),
+                    reason="Requires CPU or two CUDA devices")
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["device-optimizer", "cpu-offload"])
+@pytest.mark.parametrize("accumulation_dtype", ["bf16", "fp32"])
+# ZeRO-1 with overlap_comm is left out: it mixes up the two halves of the split parameter on its
+# own, which is a reduction defect to report separately rather than part of this contract.
+@pytest.mark.parametrize("zero_stage,overlap_comm", [(1, False), (2, False), (2, True)],
+                         ids=["stage1", "stage2", "stage2-overlap-comm"])
+def test_late_first_use_in_padded_split_partition(tmp_path, zero_stage, cpu_offload, accumulation_dtype, overlap_comm):
+    """A parameter joining a window after the first backward must sum only this window's gradients.
+
+    The padded, rank-split group makes the owned fragment start at a non-zero source offset,
+    so a rank that restores a previous sum by partition offset instead of source offset, or
+    that carries the previous update's sum into this window, produces a wrong gradient here.
+    The overlap_comm case covers the same contract when reduction is deferred to the reduction
+    stream; a CPU host has no separate streams, so it does not establish stream ordering.
+    """
+    _spawn_two_ranks(_run_split_partition_requests, tmp_path, zero_stage, cpu_offload, accumulation_dtype,
+                     overlap_comm)
+
+
+def _run_overflow_then_finite_requests(rank, rendezvous, zero_stage, cpu_offload):
+    accelerator = _join_two_rank_group(rank, rendezvous)
+    engine = None
+    try:
+        # bf16 parameters with fp32 accumulation select the compact fp32 gradient partition.
+        config = _split_partition_config(zero_stage, cpu_offload, "fp32")
+        model, engine, references, reference_optimizer = _build_split_engine(accelerator, config, 1 / 64)
+        before_overflow = _capture_params(engine)
+        overflow_window = [(("first", ), False), (("first", "second"), True)]
+        for call_index, (projections, ends_request) in enumerate(overflow_window):
+            inputs = _split_inputs(0, call_index, rank).to(device=engine.device, dtype=torch.bfloat16)
+            engine.set_gradient_accumulation_boundary(ends_request)
+            scale = float("inf") if ends_request else 1.0
+            engine.backward(engine(inputs, projections, scale))
+        engine.step()
+        _assert_params_match(before_overflow, _capture_params(engine), "overflow must skip the update", tol=1e-8)
+
+        for step, window in enumerate(_LATE_FIRST_USE_WINDOWS):
+            expected = {name: torch.zeros_like(reference) for name, reference in references.items()}
+            for call_index, (projections, ends_request) in enumerate(window):
+                inputs_per_rank = [_split_inputs(step + 1, call_index, r) for r in range(2)]
+                engine.set_gradient_accumulation_boundary(ends_request)
+                device_inputs = inputs_per_rank[rank].to(device=engine.device, dtype=torch.bfloat16)
+                engine.backward(engine(device_inputs, projections))
+                for name in projections:
+                    weight = f"{name}.weight"
+                    expected[weight] += _expected_linear_gradient(expected[weight].shape, inputs_per_rank)
+            label = f"window after overflow: step={step}, window={window}"
+            _assert_gradients(model, expected, label)
+            _assert_reference_update(model, engine, references, reference_optimizer, expected, label)
+    finally:
+        if engine is not None:
+            engine.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(get_accelerator().device_name() not in ("cpu", "cuda")
+                    or (get_accelerator().device_name() == "cuda" and get_accelerator().device_count() < 2),
+                    reason="Requires CPU or two CUDA devices")
+@pytest.mark.parametrize("zero_stage", [1, 2])
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["device-optimizer", "cpu-offload"])
+def test_compact_fp32_accumulation_recovers_after_overflow(tmp_path, zero_stage, cpu_offload):
+    """A skipped window must leave no gradient behind in the compact fp32 partition.
+
+    A multi-boundary window ends non-finite, so step() skips the update. If the skipped
+    window's sum stays resident, the next window's gradient is that sum plus the new one
+    and every later step is poisoned.
+    """
+    _spawn_two_ranks(_run_overflow_then_finite_requests, tmp_path, zero_stage, cpu_offload)
+
+
+def _run_nonboundary_only_parameter(rank, rendezvous, zero_stage, cpu_offload, accumulation_dtype, inject_overflow):
+    accelerator = _join_two_rank_group(rank, rendezvous)
+    clipping = 0.5
+    engine = None
+    try:
+        config = _split_partition_config(zero_stage, cpu_offload, accumulation_dtype, gradient_clipping=clipping)
+        model, engine, references, reference_optimizer = _build_split_engine(accelerator, config, 1 / 8)
+        before = _capture_params(engine)
+        expected = {name: torch.zeros_like(reference) for name, reference in references.items()}
+        # "second" contributes on this window's non-boundary backward only; "first" closes the request.
+        window = [(("second", ), False), (("first", ), True)]
+        for call_index, (projections, ends_request) in enumerate(window):
+            inputs_per_rank = [_split_inputs(0, call_index, r) for r in range(2)]
+            engine.set_gradient_accumulation_boundary(ends_request)
+            device_inputs = inputs_per_rank[rank].to(device=engine.device, dtype=torch.bfloat16)
+            scale = float("inf") if inject_overflow and not ends_request else 1.0
+            engine.backward(engine(device_inputs, projections, scale))
+            if scale == 1.0:
+                for name in projections:
+                    weight = f"{name}.weight"
+                    expected[weight] += _expected_linear_gradient(expected[weight].shape, inputs_per_rank)
+
+        if inject_overflow:
+            engine.step()
+            _assert_params_match(before,
+                                 _capture_params(engine),
+                                 "a non-finite non-boundary gradient must skip the update",
+                                 tol=1e-8)
+            return
+
+        _assert_gradients(model, expected, "non-boundary-only parameter")
+        flat_expected = torch.cat([grad.reshape(-1) for grad in expected.values()])
+        expected_norm = flat_expected.norm(2).item()
+        assert expected_norm > clipping, "the fixture must exceed the clipping threshold"
+        for name in expected:
+            references[name].grad = expected[name]
+        # PyTorch's own clipping utility is the reference for the scale DeepSpeed should apply.
+        torch.nn.utils.clip_grad_norm_(references.values(), clipping)
+        reference_optimizer.step()
+        engine.step()
+        reported_norm = engine.get_global_grad_norm()
+        assert reported_norm == pytest.approx(
+            expected_norm, rel=1e-3), (f"global grad norm {reported_norm} excludes the non-boundary-only parameter "
+                                       f"(expected {expected_norm})")
+        for name, param in model.named_parameters():
+            # bf16 parameters round the clipped fp32 update, so one bf16 step of tolerance.
+            torch.testing.assert_close(param.detach().cpu(),
+                                       references[name].detach().to(torch.bfloat16),
+                                       rtol=1e-2,
+                                       atol=0,
+                                       msg=f"clipped update for {name}")
+    finally:
+        if engine is not None:
+            engine.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(get_accelerator().device_name() not in ("cpu", "cuda")
+                    or (get_accelerator().device_name() == "cuda" and get_accelerator().device_count() < 2),
+                    reason="Requires CPU or two CUDA devices")
+@pytest.mark.parametrize("zero_stage", [1, 2])
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["device-optimizer", "cpu-offload"])
+@pytest.mark.parametrize("accumulation_dtype", ["bf16", "fp32"])
+@pytest.mark.parametrize("inject_overflow", [False, True], ids=["clipping", "inf-detection"])
+def test_nonboundary_only_parameter_reaches_norm_and_overflow(tmp_path, zero_stage, cpu_offload, accumulation_dtype,
+                                                              inject_overflow):
+    """A parameter that never joins a boundary backward still has to be clipped and screened.
+
+    Recording the norm and the overflow flag only for parameters seen at a boundary would
+    under-report the global norm, so clipping would scale the update too little, and would
+    let a non-finite gradient from a non-boundary backward through into the update.
+    """
+    _spawn_two_ranks(_run_nonboundary_only_parameter, tmp_path, zero_stage, cpu_offload, accumulation_dtype,
+                     inject_overflow)
+
+
+# Two contributions that are each exact in bf16 but whose sum is not: bf16 keeps 8 significand
+# bits, so 1 + 1/256 rounds back to 1 and the accumulation dtype becomes observable.
+_LARGE_CONTRIBUTION = 1.0
+_SMALL_CONTRIBUTION = 1.0 / 256.0
+
+
+def _fractional_inputs(column_sum, rank):
+    # Four rows that sum to column_sum after averaging the two ranks, with every value a
+    # power-of-two multiple so that bf16 holds the inputs and their column sums exactly.
+    per_row = column_sum / 4
+    offset = per_row / 2 if rank == 1 else -per_row / 2
+    return torch.full((4, 3), per_row + offset)
+
+
+def _run_fractional_master_conversion(rank, rendezvous, accumulation_dtype):
+    accelerator = _join_two_rank_group(rank, rendezvous)
+    engine = None
+    try:
+        config = _split_partition_config(2, True, accumulation_dtype)
+        model, engine, references, reference_optimizer = _build_split_engine(accelerator, config, 1.0)
+        exact_sum = _LARGE_CONTRIBUTION + _SMALL_CONTRIBUTION
+        rounded_sum = torch.tensor(exact_sum, dtype=torch.bfloat16).item()
+        assert rounded_sum != exact_sum, "the fixture must be a sum bf16 cannot represent"
+        expected_value = exact_sum if accumulation_dtype == "fp32" else rounded_sum
+        for call_index, column_sum in enumerate([_LARGE_CONTRIBUTION, _SMALL_CONTRIBUTION]):
+            inputs = _fractional_inputs(column_sum, rank).to(device=engine.device, dtype=torch.bfloat16)
+            engine.set_gradient_accumulation_boundary(call_index == 1)
+            engine.backward(engine(inputs))
+        expected = {name: torch.full_like(reference, expected_value) for name, reference in references.items()}
+        _assert_gradients(model, expected, f"fractional accumulation in {accumulation_dtype}")
+        _assert_reference_update(model, engine, references, reference_optimizer, expected,
+                                 f"fractional accumulation in {accumulation_dtype}")
+    finally:
+        if engine is not None:
+            engine.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(get_accelerator().device_name() not in ("cpu", "cuda")
+                    or (get_accelerator().device_name() == "cuda" and get_accelerator().device_count() < 2),
+                    reason="Requires CPU or two CUDA devices")
+@pytest.mark.parametrize("accumulation_dtype", ["bf16", "fp32"])
+def test_fractional_contributions_keep_configured_accumulation_dtype(tmp_path, accumulation_dtype):
+    """Requested fp32 accumulation must not be rounded through the bf16 parameter dtype.
+
+    The window adds 1 and 1/256. An implementation that keeps the running sum in the model
+    dtype, or that round-trips the fp32 master gradient through bf16 between requests, drops
+    the small contribution and returns 1 where fp32 accumulation owes 1.00390625.
+    """
+    _spawn_two_ranks(_run_fractional_master_conversion, tmp_path, accumulation_dtype)
+
+
+def _run_unmanaged_accumulation(rank, rendezvous, zero_stage, cpu_offload, accumulation_dtype):
+    accelerator = _join_two_rank_group(rank, rendezvous)
+    engine = None
+    try:
+        config = _split_partition_config(zero_stage, cpu_offload, accumulation_dtype, managed=False)
+        model, engine, references, reference_optimizer = _build_split_engine(accelerator, config, 1 / 64)
+        # Unmanaged mode forbids set_gradient_accumulation_boundary(): step() is the boundary.
+        for step, calls in enumerate([3, 1, 2]):
+            expected = {name: torch.zeros_like(reference) for name, reference in references.items()}
+            for call_index in range(calls):
+                inputs_per_rank = [_split_inputs(step, call_index, r) for r in range(2)]
+                device_inputs = inputs_per_rank[rank].to(device=engine.device, dtype=torch.bfloat16)
+                engine.backward(engine(device_inputs))
+                for name in ("first", "second"):
+                    weight = f"{name}.weight"
+                    expected[weight] += _expected_linear_gradient(expected[weight].shape, inputs_per_rank)
+            label = f"unmanaged step={step}, backwards={calls}"
+            _assert_reference_update(model, engine, references, reference_optimizer, expected, label)
+    finally:
+        if engine is not None:
+            engine.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(get_accelerator().device_name() not in ("cpu", "cuda")
+                    or (get_accelerator().device_name() == "cuda" and get_accelerator().device_count() < 2),
+                    reason="Requires CPU or two CUDA devices")
+@pytest.mark.parametrize("zero_stage", [1, 2])
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["device-optimizer", "cpu-offload"])
+@pytest.mark.parametrize("accumulation_dtype", ["bf16", "fp32"])
+def test_unmanaged_accumulation_sums_every_backward(tmp_path, zero_stage, cpu_offload, accumulation_dtype):
+    """With managed_gradient_accumulation=false, step() must consume every backward since the last one.
+
+    The caller owns the window here, so dropping the earlier backwards, or carrying the
+    previous step's sum into the next window, changes the update that step() applies.
+    """
+    _spawn_two_ranks(_run_unmanaged_accumulation, tmp_path, zero_stage, cpu_offload, accumulation_dtype)
