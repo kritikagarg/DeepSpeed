@@ -213,7 +213,7 @@ Example of <i>**scheduler**</i>
 
 | Description                                                                                                                   | Default |
 | ----------------------------------------------------------------------------------------------------------------------------- | ------- |
-| During gradient averaging perform communication with selected data type. By default it will be determined by selected regime  |  None   |
+| During gradient averaging perform communication with selected data type. By default it will be determined by selected regime, except that ZeRO stage 1 with `data_types.grad_accum_dtype: "fp32"` on a 16-bit model communicates in fp32 so its accumulated window is not rounded. Set this explicitly to keep a narrower reduction  |  None   |
 
 <i>**gradient_allreduce_op**</i>: [string]
 

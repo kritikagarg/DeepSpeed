@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 """
-Accumulation precision of ZeRO-1/2 CPU offload across one optimizer window.
+Accumulation precision of ZeRO-1/2 across one optimizer window, with and without CPU offload.
 
 Each micro-step's gradient is exactly representable in bf16 (values (128 + k) / 128), so the
 exact window sum is known. The only rounding comes from the accumulation dtype and the host
@@ -104,9 +104,9 @@ class TestZeroOffloadAccumPrecision(DistributedTest):
             with open(out, "a") as f:
                 f.write(f"stage={stage} master={'bf16' if low_precision_master else 'fp32'} "
                         f"accum={accumulation_dtype or 'bf16'} rel_max_err={error:.3e}\n")
-        if stage == 2 and not low_precision_master and accumulation_dtype == "fp32":
-            # The supported case: the window sum is exact. Stage 1 rounds its window sum to the
-            # 16-bit reduction dtype once (same error on the base commit); it is characterized, not required.
+        if not low_precision_master and accumulation_dtype == "fp32":
+            # Both stages must keep the window sum exact. Stage 1 used to round it once to the
+            # 16-bit communication dtype on the way into the reduction (#9047).
             assert error == 0.0, f"fp32 accumulation with fp32 masters lost precision: {error:.3e}"
 
 
@@ -209,3 +209,79 @@ class TestZeroOffloadReleaseOption(DistributedTest):
         assert err_kept == 0.0, f"resident path lost precision: {err_kept:.3e}"
         assert err_released == 0.0, f"released path lost precision: {err_released:.3e}"
         assert torch.equal(w_released, w_kept), "release option changed the optimizer result"
+
+
+def _dense_config(stage, accumulation_dtype, communication_data_type):
+    """ZeRO without offload, fp16 params, static loss scale so the window sum is the plain gradient sum."""
+    config = {
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "train_micro_batch_size_per_gpu": 1,
+        "gradient_clipping": 0,
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1e-3,
+                "torch_adam": True
+            }
+        },
+        "zero_optimization": {
+            "stage": stage
+        },
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 1.0
+        },
+    }
+    if accumulation_dtype is not None:
+        config["data_types"] = {"grad_accum_dtype": accumulation_dtype}
+    if communication_data_type is not None:
+        config["communication_data_type"] = communication_data_type
+    return config
+
+
+def _dense_window_error(stage, accumulation_dtype, communication_data_type=None):
+    """Relative max error of the window's gradient sum against the exact sum, read before step()."""
+    torch.manual_seed(0)
+    model = Weighted(NUMEL)
+    engine, _, _, _ = deepspeed.initialize(model=model,
+                                           model_parameters=model.parameters(),
+                                           config=_dense_config(stage, accumulation_dtype, communication_data_type))
+    try:
+        generator = torch.Generator().manual_seed(1234)
+        exact = torch.zeros(NUMEL, dtype=torch.float64)
+        for step in range(MICRO_STEPS):
+            k = torch.randint(0, 128, (NUMEL, ), generator=generator)
+            c = ((128 + k).float() / 128).to(device=engine.device, dtype=torch.float16)
+            exact += c.double().cpu()
+            engine.set_gradient_accumulation_boundary(step == MICRO_STEPS - 1)
+            engine.backward(engine(c))
+        grad = safe_get_full_grad(engine.module.w).detach().float().cpu().double()
+        # Take the step as well, so a reduction dtype the optimizer cannot consume shows up here.
+        engine.step()
+        return ((grad - exact).abs().max() / exact.abs().max()).item()
+    finally:
+        engine.destroy()
+
+
+class TestZeroDenseAccumReductionDtype(DistributedTest):
+    """`grad_accum_dtype: fp32` must survive the reduction, and an explicit comm dtype must still win.
+
+    Each micro-step gradient is (128 + k) / 128 with integer k, which is exact in fp16, so the exact
+    window sum is known independently of how DeepSpeed computes it. Without the fix, ZeRO-1 rounds its
+    fp32 window sum to the inferred fp16 communication dtype before the reduction and the sum read
+    before step() is wrong by ~3e-4 instead of being exact.
+    """
+
+    world_size = 1
+
+    @pytest.mark.parametrize("stage", [1, 2])
+    def test_fp32_accumulation_window_sum_is_exact(self, stage):
+        error = _dense_window_error(stage, "fp32")
+        assert error == 0.0, f"stage {stage} fp32 accumulation lost precision: {error:.3e}"
+
+    def test_explicit_communication_data_type_is_respected(self):
+        # The documented way back to the old behavior: an explicit 16-bit comm dtype keeps its
+        # bandwidth, so the fp32 window sum is still rounded into the reduction.
+        error = _dense_window_error(1, "fp32", communication_data_type="fp16")
+        assert error > 0.0, "an explicit 16-bit communication_data_type was silently promoted to fp32"
