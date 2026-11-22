@@ -2729,6 +2729,27 @@ class DeepSpeedEngine(Module):
 
         return optimizer
 
+    def _zero_gradient_reduction_dtype(self, zero_stage, model_dtype, gradient_accumulation_dtype):
+        """Resolve the dtype the ZeRO stage 1/2 optimizer reduces gradients in.
+
+        ZeRO-1 sums a whole accumulation window into an fp32 `grad_accum` buffer and reduces that
+        buffer once. Rounding it to an inferred 16-bit communication dtype discards exactly the
+        precision `grad_accum_dtype: fp32` was requested for (#9047). ZeRO-2 reduces every
+        micro-step in the model dtype and only accumulates afterwards, so its reduction input is
+        already 16-bit and promoting it would cost bandwidth without buying accuracy.
+
+        An explicitly configured `communication_data_type` is always honored: that setting is a
+        deliberate bandwidth choice, and it is also how to ask for the previous rounding behavior.
+        """
+        comm_dtype = self.communication_data_type
+        if self._config.communication_data_type is not None:
+            return comm_dtype
+        reduces_whole_window = zero_stage == ZeroStageEnum.optimizer_states
+        accumulates_in_fp32 = model_dtype != torch.float32 and gradient_accumulation_dtype == torch.float32
+        if reduces_whole_window and accumulates_in_fp32:
+            return gradient_accumulation_dtype
+        return comm_dtype
+
     def _configure_zero_optimizer(self, optimizer):
         zero_stage = self.zero_optimization_stage()
 
@@ -2800,7 +2821,8 @@ class DeepSpeedEngine(Module):
                 bf16_master_weights_and_gradients=self.bf16_master_weights_and_gradients(),
                 bf16_optimizer_states=self.bf16_optimizer_states(),
                 gradient_accumulation_dtype=gradient_accumulation_dtype,
-                communication_data_type=self.communication_data_type,
+                communication_data_type=self._zero_gradient_reduction_dtype(zero_stage, model_dtype,
+                                                                            gradient_accumulation_dtype),
                 elastic_checkpoint=self.zero_elastic_checkpoint(),
                 check_grad_overflow=check_grad_overflow,
                 compute_grad_norm=self.zero_compute_grad_norm(),
